@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: recipe-extractor
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --timeout 300
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.7
+      - key: MAX_WORKERS
+        value: 1
