@@ -4,12 +4,13 @@ import json
 import re
 import concurrent.futures
 import time
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, Response
 from googleapiclient.discovery import build
 import yt_dlp
 import openai
 from dotenv import load_dotenv
 import logging
+from threading import Lock
 
 # 로깅 설정
 logging.basicConfig(
@@ -30,6 +31,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "recipes.db")
+FREE_TIER_LIMIT = 10  # 무료 사용자 제한
 
 # API 키 검증
 if not OPENAI_API_KEY or not YOUTUBE_API_KEY:
@@ -41,6 +43,10 @@ youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", os.urandom(24))
+
+# 진행 상황 추적을 위한 전역 딕셔너리
+processing_status = {}
+status_lock = Lock()
 
 # --- 데이터베이스 함수 ---
 def get_db_connection():
@@ -65,7 +71,6 @@ def init_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # 인덱스 추가로 검색 속도 향상
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_ingredients 
         ON recipes(ingredients)
@@ -152,7 +157,7 @@ def download_audio(video_url, video_id, max_retries=3):
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': '128',  # 품질 낮춰서 속도 향상
+                    'preferredquality': '128',
                 }],
             }
             
@@ -214,8 +219,6 @@ def extract_recipe_info(transcript, title):
         )
         
         result = response.choices[0].message.content.strip()
-        
-        # JSON 정리
         result = re.sub(r'^```json?\s*', '', result)
         result = re.sub(r'\s*```$', '', result)
         
@@ -226,7 +229,6 @@ def extract_recipe_info(transcript, title):
         if isinstance(ingredients, list):
             ingredients = ','.join(ingredients)
         
-        # 재료 정리
         ingredients = re.sub(r'\s+', '', ingredients)
         ingredients = re.sub(r',+', ',', ingredients)
         
@@ -254,17 +256,32 @@ def extract_from_description(description, title):
     
     return title, ""
 
+# --- 진행 상황 업데이트 함수 ---
+def update_status(session_id, current, total, status_text, video_title=""):
+    """진행 상황 업데이트"""
+    with status_lock:
+        processing_status[session_id] = {
+            'current': current,
+            'total': total,
+            'percentage': int((current / total) * 100) if total > 0 else 0,
+            'status': status_text,
+            'video_title': video_title,
+            'timestamp': time.time()
+        }
+
 # --- 메인 처리 함수 ---
-def process_single_video(video_id):
+def process_single_video(video_id, session_id, current_index, total_videos):
     """단일 비디오 처리"""
     
     # 중복 체크
     if check_if_video_exists(video_id):
         logger.info(f"[{video_id}] 이미 처리됨, 건너뜀")
+        update_status(session_id, current_index, total_videos, "이미 처리된 영상 건너뜀")
         return {"status": "skipped", "video_id": video_id}
     
     try:
         # 1. 비디오 정보 가져오기
+        update_status(session_id, current_index, total_videos, "영상 정보 가져오는 중...")
         video_info = get_video_info(video_id)
         if not video_info:
             return {"status": "error", "video_id": video_id, "message": "비디오 정보 없음"}
@@ -273,14 +290,18 @@ def process_single_video(video_id):
         description = video_info['description']
         video_url = video_info['url']
         
+        update_status(session_id, current_index, total_videos, "오디오 다운로드 중...", title)
         logger.info(f"처리 시작: {title}")
         
         # 2. 오디오 다운로드 및 변환
         try:
             audio_file = download_audio(video_url, video_id)
+            
+            update_status(session_id, current_index, total_videos, "음성을 텍스트로 변환 중...", title)
             transcript = transcribe_audio(audio_file)
             
             # 3. LLM으로 정보 추출
+            update_status(session_id, current_index, total_videos, "재료 추출 중...", title)
             dish_name, ingredients = extract_recipe_info(transcript, title)
             
             # 임시 파일 삭제
@@ -293,6 +314,7 @@ def process_single_video(video_id):
                     
         except Exception as e:
             logger.warning(f"오디오 처리 실패, 설명에서 추출 시도: {e}")
+            update_status(session_id, current_index, total_videos, "설명에서 재료 추출 중...", title)
             dish_name, ingredients = extract_from_description(description, title)
         
         # 4. DB 저장
@@ -308,7 +330,8 @@ def process_single_video(video_id):
         conn.commit()
         conn.close()
         
-        logger.info(f"저장 완료: {title} | 재료: {ingredients[:50]}...")
+        update_status(session_id, current_index, total_videos, "완료!", title)
+        logger.info(f"저장 완료: {title}")
         return {
             "status": "success",
             "video_id": video_id,
@@ -318,6 +341,7 @@ def process_single_video(video_id):
         
     except Exception as e:
         logger.error(f"비디오 처리 실패 ({video_id}): {e}")
+        update_status(session_id, current_index, total_videos, f"오류 발생: {str(e)[:50]}")
         return {"status": "error", "video_id": video_id, "message": str(e)}
 
 # --- Flask 라우트 ---
@@ -339,72 +363,112 @@ def index():
             <title>레시피 추출 시스템</title>
             <style>
                 body {{
-                    font-family: Arial, sans-serif;
+                    font-family: 'Segoe UI', sans-serif;
                     max-width: 800px;
                     margin: 50px auto;
                     padding: 20px;
-                    background: #f5f5f5;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
                 }}
                 .container {{
                     background: white;
-                    padding: 30px;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                    padding: 40px;
+                    border-radius: 20px;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
                 }}
                 h1 {{
                     color: #333;
                     text-align: center;
+                    margin-bottom: 10px;
+                }}
+                .subtitle {{
+                    text-align: center;
+                    color: #666;
+                    margin-bottom: 30px;
                 }}
                 .stats {{
                     background: #e3f2fd;
-                    padding: 15px;
-                    border-radius: 5px;
+                    padding: 20px;
+                    border-radius: 10px;
                     margin: 20px 0;
                     text-align: center;
                 }}
+                .stats-number {{
+                    font-size: 36px;
+                    font-weight: bold;
+                    color: #667eea;
+                }}
+                .limit-notice {{
+                    background: #fff3cd;
+                    border-left: 4px solid #ffc107;
+                    padding: 15px;
+                    margin: 20px 0;
+                    border-radius: 5px;
+                }}
                 input[type="text"] {{
                     width: 100%;
-                    padding: 12px;
+                    padding: 15px;
                     margin: 10px 0;
-                    border: 1px solid #ddd;
-                    border-radius: 5px;
+                    border: 2px solid #ddd;
+                    border-radius: 10px;
                     box-sizing: border-box;
+                    font-size: 16px;
+                }}
+                input[type="text"]:focus {{
+                    outline: none;
+                    border-color: #667eea;
                 }}
                 button {{
                     width: 100%;
-                    padding: 12px;
-                    background: #1976d2;
+                    padding: 15px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                     color: white;
                     border: none;
-                    border-radius: 5px;
+                    border-radius: 10px;
                     cursor: pointer;
-                    font-size: 16px;
+                    font-size: 18px;
+                    font-weight: bold;
+                    transition: transform 0.2s;
                 }}
                 button:hover {{
-                    background: #1565c0;
+                    transform: translateY(-2px);
+                    box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
                 }}
                 .link {{
                     display: block;
                     text-align: center;
                     margin-top: 20px;
-                    color: #1976d2;
+                    color: #667eea;
                     text-decoration: none;
+                    font-weight: bold;
+                }}
+                .link:hover {{
+                    text-decoration: underline;
                 }}
             </style>
         </head>
         <body>
             <div class="container">
                 <h1>🍳 유튜브 레시피 추출 시스템</h1>
+                <p class="subtitle">AI가 요리 영상을 분석하여 레시피를 추출합니다</p>
+                
                 <div class="stats">
-                    <strong>현재 데이터베이스: {count}개의 레시피</strong>
+                    <div class="stats-number">{count}</div>
+                    <div>개의 레시피가 저장되어 있습니다</div>
                 </div>
+                
+                <div class="limit-notice">
+                    <strong>⚡ 무료 버전 제한:</strong> 한 번에 최대 10개의 영상까지 처리할 수 있습니다.
+                </div>
+                
                 <form method="post" action="/process">
-                    <label for="playlist_url">플레이리스트 URL:</label>
+                    <label for="playlist_url"><strong>플레이리스트 URL:</strong></label>
                     <input type="text" id="playlist_url" name="playlist_url" 
                            placeholder="https://www.youtube.com/playlist?list=..." required>
-                    <button type="submit">영상 처리 시작</button>
+                    <button type="submit">🚀 영상 처리 시작</button>
                 </form>
-                <a href="/recommend" class="link">📋 레시피 추천받기</a>
+                
+                <a href="/recommend" class="link">📋 레시피 추천받기 →</a>
             </div>
         </body>
         </html>
@@ -423,39 +487,86 @@ def process_playlist():
         return "유효하지 않은 플레이리스트 URL입니다.", 400
     
     playlist_id = match.group(1)
-    return redirect(url_for('process_playlist_manual', playlist_id=playlist_id))
+    
+    # 세션 ID 생성
+    session_id = os.urandom(16).hex()
+    session['processing_id'] = session_id
+    
+    return redirect(url_for('process_playlist_manual', playlist_id=playlist_id, session_id=session_id))
 
 @app.route('/process_playlist/<playlist_id>')
 def process_playlist_manual(playlist_id):
     """플레이리스트 처리 실행"""
+    session_id = request.args.get('session_id', os.urandom(16).hex())
+    session['processing_id'] = session_id
+    
     video_ids = get_playlist_items(playlist_id)
     
     if not video_ids:
         return "플레이리스트를 불러올 수 없습니다.", 400
     
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(process_single_video, vid) for vid in video_ids]
+    # 무료 버전 제한: 10개로 제한
+    original_count = len(video_ids)
+    if len(video_ids) > FREE_TIER_LIMIT:
+        video_ids = video_ids[:FREE_TIER_LIMIT]
+        limited = True
+    else:
+        limited = False
+    
+    # 진행 상황 페이지로 리다이렉트
+    return render_template('processing.html', 
+                         session_id=session_id, 
+                         total_videos=len(video_ids),
+                         original_count=original_count,
+                         limited=limited,
+                         playlist_id=playlist_id)
+
+@app.route('/start_processing/<playlist_id>/<session_id>')
+def start_processing(playlist_id, session_id):
+    """실제 처리 시작 (백그라운드)"""
+    video_ids = get_playlist_items(playlist_id)
+    
+    if len(video_ids) > FREE_TIER_LIMIT:
+        video_ids = video_ids[:FREE_TIER_LIMIT]
+    
+    # 초기 상태 설정
+    update_status(session_id, 0, len(video_ids), "처리 준비 중...")
+    
+    # 백그라운드에서 처리
+    def process_videos():
+        results = []
+        for idx, video_id in enumerate(video_ids, 1):
+            result = process_single_video(video_id, session_id, idx, len(video_ids))
+            results.append(result)
+            time.sleep(1)  # API 제한 방지
         
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                logger.error(f"처리 중 예외: {e}")
+        # 완료 상태
+        success_count = sum(1 for r in results if r.get('status') == 'success')
+        with status_lock:
+            processing_status[session_id]['completed'] = True
+            processing_status[session_id]['success_count'] = success_count
+            processing_status[session_id]['total'] = len(video_ids)
     
-    success_count = sum(1 for r in results if r.get('status') == 'success')
-    skipped_count = sum(1 for r in results if r.get('status') == 'skipped')
-    error_count = sum(1 for r in results if r.get('status') == 'error')
+    import threading
+    thread = threading.Thread(target=process_videos)
+    thread.daemon = True
+    thread.start()
     
-    return f'''
-        <h1>처리 완료!</h1>
-        <p>성공: {success_count}개</p>
-        <p>건너뜀: {skipped_count}개</p>
-        <p>실패: {error_count}개</p>
-        <br>
-        <a href="/recommend">레시피 추천받기</a> | <a href="/">홈으로</a>
-    '''
+    return jsonify({"status": "started"})
+
+@app.route('/status/<session_id>')
+def get_status(session_id):
+    """진행 상황 조회"""
+    with status_lock:
+        status = processing_status.get(session_id, {
+            'current': 0,
+            'total': 0,
+            'percentage': 0,
+            'status': '준비 중...',
+            'video_title': '',
+            'completed': False
+        })
+    return jsonify(status)
 
 @app.route('/recommend')
 def recommend_page():
@@ -470,10 +581,8 @@ def recommend_recipe():
     if not user_ingredients_input:
         return render_template('recommend.html', message="재료를 입력해주세요.")
     
-    # 재료 파싱
     user_ingredients = set(i.strip() for i in user_ingredients_input.split(',') if i.strip())
     
-    # DB 검색
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -489,7 +598,6 @@ def recommend_recipe():
         return render_template('recommend.html', 
                              message="해당 재료로 만들 수 있는 레시피를 찾을 수 없습니다.")
     
-    # 매칭률 계산
     recipes = []
     for row in results:
         recipe_ings = set(i.strip() for i in row['ingredients'].split(',') if i.strip())
@@ -525,7 +633,6 @@ def api_stats():
     
     return jsonify({"total_recipes": total})
 
-# --- 메인 실행 ---
 if __name__ == '__main__':
     init_database()
     port = int(os.getenv("PORT", 5000))
