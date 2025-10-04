@@ -41,52 +41,8 @@ if not OPENAI_API_KEY or not YOUTUBE_API_KEY:
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
-# app.py 상단 부근 (Flask 앱 생성 직후)에 추가
-
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", os.urandom(24))
-
-# 데이터베이스 초기화를 여기로 이동!
-def ensure_database():
-    """앱 시작 시 데이터베이스 확인 및 초기화"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # 테이블 존재 확인
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='recipes'
-    """)
-    
-    if not cursor.fetchone():
-        logger.info("데이터베이스 테이블 생성 중...")
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS recipes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                video_id TEXT UNIQUE NOT NULL,
-                title TEXT NOT NULL,
-                description TEXT,
-                ingredients TEXT,
-                dish_name TEXT,
-                url TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_ingredients 
-            ON recipes(ingredients)
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_video_id 
-            ON recipes(video_id)
-        """)
-        conn.commit()
-        logger.info("데이터베이스 초기화 완료")
-    
-    conn.close()
-
-# 앱 시작 시 자동 실행
-ensure_database()
 
 # 진행 상황 추적을 위한 전역 딕셔너리
 processing_status = {}
@@ -392,15 +348,11 @@ def process_single_video(video_id, session_id, current_index, total_videos):
 @app.route('/')
 def index():
     """메인 페이지"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM recipes")
-        count = cursor.fetchone()[0]
-        conn.close()
-    except sqlite3.OperationalError:
-        # 테이블이 없으면 0으로 처리
-        count = 0
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM recipes")
+    count = cursor.fetchone()[0]
+    conn.close()
     
     return f'''
         <!DOCTYPE html>
