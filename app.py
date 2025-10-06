@@ -31,6 +31,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "recipes.db")
+DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL URL
 FREE_TIER_LIMIT = 10  # 무료 사용자 제한
 
 # API 키 검증
@@ -57,31 +58,37 @@ def get_db_connection():
 
 def init_database():
     """데이터베이스 초기화"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS recipes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            video_id TEXT UNIQUE NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT,
-            ingredients TEXT,
-            dish_name TEXT,
-            url TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_ingredients 
-        ON recipes(ingredients)
-    """)
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_video_id 
-        ON recipes(video_id)
-    """)
-    conn.commit()
-    conn.close()
-    logger.info("데이터베이스 초기화 완료")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS recipes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                ingredients TEXT,
+                dish_name TEXT,
+                url TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ingredients 
+            ON recipes(ingredients)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_video_id 
+            ON recipes(video_id)
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("데이터베이스 초기화 완료")
+    except Exception as e:
+        logger.error(f"데이터베이스 초기화 실패: {e}")
+
+# 앱 시작 시 데이터베이스 초기화
+init_database()
 
 def check_if_video_exists(video_id):
     """비디오 중복 체크"""
@@ -348,11 +355,15 @@ def process_single_video(video_id, session_id, current_index, total_videos):
 @app.route('/')
 def index():
     """메인 페이지"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM recipes")
-    count = cursor.fetchone()[0]
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM recipes")
+        count = cursor.fetchone()[0]
+        conn.close()
+    except Exception as e:
+        logger.error(f"데이터베이스 조회 오류: {e}")
+        count = 0
     
     return f'''
         <!DOCTYPE html>

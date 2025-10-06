@@ -7,3 +7,4 @@ httpx==0.24.1
 h11==0.14.0
 anyio==3.7.1
 gunicorn==21.2.0
+psycopg2-binary==2.9.9
